@@ -1,4 +1,4 @@
-# openpane 🌸
+# openpane 
 
 > Open the pane. See the world beyond your terminal.
 
