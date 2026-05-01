@@ -197,6 +197,31 @@ def fetch_json(url: str, timeout: int = 4) -> Optional[dict]:
         return None
 
 
+# ── Config (saved location) ─────────────────────────────────
+import os
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".openpane.json"
+
+def load_config() -> dict:
+    """Load saved config from ~/.openpane.json (returns {} if missing)."""
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_config(data: dict) -> None:
+    """Save config to ~/.openpane.json."""
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
 # ── Location + weather ──────────────────────────────────────
 @dataclass
 class LocationInfo:
@@ -215,8 +240,27 @@ class WeatherInfo:
     city: str
     country: str
 
-def get_location() -> Optional[LocationInfo]:
-    """Detect current city and coordinates via IP geolocation."""
+def get_location_by_ip() -> Optional[LocationInfo]:
+    """
+    Detect current city via IP geolocation.
+    Tries ipinfo.io first (more accurate), falls back to ip-api.com.
+    """
+    # Try ipinfo.io — usually more accurate (returns actual neighborhood)
+    data = fetch_json("https://ipinfo.io/json")
+    if data and "loc" in data:
+        try:
+            lat_str, lon_str = data["loc"].split(",")
+            return LocationInfo(
+                city=data.get("city", "Unknown"),
+                country=data.get("country", ""),
+                lat=float(lat_str),
+                lon=float(lon_str),
+                timezone=data.get("timezone", "Asia/Seoul"),
+            )
+        except (ValueError, KeyError):
+            pass
+
+    # Fallback: ip-api.com
     data = fetch_json("http://ip-api.com/json/?fields=city,country,lat,lon,timezone,status")
     if data and data.get("status") == "success":
         return LocationInfo(
@@ -227,6 +271,48 @@ def get_location() -> Optional[LocationInfo]:
             timezone=data.get("timezone", "Asia/Seoul"),
         )
     return None
+
+
+def geocode_city(city_name: str) -> Optional[LocationInfo]:
+    """
+    Look up coordinates for a city name using Open-Meteo's geocoding API.
+    Free, no API key required.
+    """
+    url = (
+        f"https://geocoding-api.open-meteo.com/v1/search"
+        f"?name={urllib.request.quote(city_name)}&count=1"
+    )
+    data = fetch_json(url)
+    if not data or not data.get("results"):
+        return None
+
+    r = data["results"][0]
+    return LocationInfo(
+        city=r.get("name", city_name),
+        country=r.get("country_code", ""),
+        lat=float(r.get("latitude", 0)),
+        lon=float(r.get("longitude", 0)),
+        timezone=r.get("timezone", "UTC"),
+    )
+
+
+def get_location() -> Optional[LocationInfo]:
+    """
+    Get current location.
+    1. If saved in config, use that.
+    2. Otherwise detect via IP.
+    """
+    config = load_config()
+    if "city" in config and "lat" in config:
+        return LocationInfo(
+            city=config["city"],
+            country=config.get("country", ""),
+            lat=config["lat"],
+            lon=config["lon"],
+            timezone=config.get("timezone", "UTC"),
+        )
+    return get_location_by_ip()
+
 
 def get_weather(loc: LocationInfo) -> Optional[WeatherInfo]:
     """Fetch real-time weather from Open-Meteo for the given location."""
@@ -265,14 +351,27 @@ def get_weather(loc: LocationInfo) -> Optional[WeatherInfo]:
 # ── Renderer ────────────────────────────────────────────────
 class WindowRenderer:
     """
-    Renders an animated weather scene into the terminal background.
-    Particles float down / across the screen based on the current weather.
+    Renders an animated weather scene into the BOTTOM N rows of the terminal.
+    The rest of the terminal stays free for normal command input.
+
+    Layout:
+        [normal terminal — commands, output, etc.]
+        ─────────────────────────────────────────  <- divider
+        [weather particles — PANE_ROWS rows]
+        [HUD: city / temp / season]
     """
 
-    def __init__(self, weather: WeatherInfo, rows: int, cols: int):
+    PANE_ROWS = 8  # how many rows the weather pane occupies
+
+    def __init__(self, weather: WeatherInfo, total_rows: int, cols: int):
         self.weather = weather
-        self.rows = rows
+        self.total_rows = total_rows
         self.cols = cols
+        # Weather pane lives in the bottom PANE_ROWS rows
+        self.rows = self.PANE_ROWS
+        # Absolute terminal row where the pane starts
+        self.pane_start = total_rows - self.PANE_ROWS
+
         self.particles: list[Particle] = []
         self.running = False
         self._lock = threading.Lock()
@@ -291,7 +390,7 @@ class WindowRenderer:
         self._init_particles()
 
     def _init_particles(self):
-        """Seed initial particles spread across the screen."""
+        """Seed initial particles spread across the pane."""
         for _ in range(self.pset["density"]):
             self.particles.append(self._new_particle(random_row=True))
 
@@ -313,34 +412,47 @@ class WindowRenderer:
         )
 
     def _render_frame(self):
-        """Write one full frame to stdout."""
+        """
+        Render one frame into the bottom pane only.
+        After drawing, move cursor back to just above the pane
+        so normal shell output still works above it.
+        """
         out = []
         bg_code = bg(self.bg_r, self.bg_g, self.bg_b)
 
-        # Fill background rows
-        for row in range(1, self.rows + 1):
-            out.append(move(row, 1))
+        # Draw divider line
+        divider_row = self.pane_start
+        out.append(move(divider_row, 1))
+        out.append(bg(20, 20, 20) + fg(60, 60, 60))
+        out.append("─" * self.cols)
+
+        # Fill pane background
+        for i in range(self.rows):
+            abs_row = self.pane_start + 1 + i
+            out.append(move(abs_row, 1))
             out.append(bg_code)
             out.append(" " * self.cols)
 
-        # Draw each particle
+        # Draw particles inside the pane
         with self._lock:
             for p in self.particles:
                 r = int(p.row)
                 c = int(p.col)
-                if 1 <= r <= self.rows and 1 <= c <= self.cols:
-                    out.append(move(r, c))
+                abs_row = self.pane_start + 1 + r
+                if 0 <= r < self.rows and 1 <= c <= self.cols:
+                    out.append(move(abs_row, c))
                     out.append(bg_code + fg(p.r, p.g, p.b))
                     out.append(p.char)
 
-        # Lightning flash effect for thunderstorms
+        # Lightning flash
         if self.weather.state == "thunder" and self._lightning_timer > 0:
             lc = random.randint(1, self.cols)
-            for lr in range(1, min(8, self.rows)):
-                out.append(move(lr, lc + random.randint(-1, 1)))
+            for i in range(min(4, self.rows)):
+                abs_row = self.pane_start + 1 + i
+                out.append(move(abs_row, lc + random.randint(-1, 1)))
                 out.append(bg(255, 255, 200) + fg(255, 255, 100) + "│")
 
-        # HUD: city, temperature, season — bottom right corner
+        # HUD: city, temp, season — last row of pane, right-aligned
         season_emoji = {"spring": "🌸", "summer": "☀️", "autumn": "🍂", "winter": "❄️"}
         state_emoji  = {"clear": "☀️", "cloudy": "☁️", "rain": "🌧", "snow": "❄️", "thunder": "⛈"}
         hud = (
@@ -350,21 +462,23 @@ class WindowRenderer:
             f"{season_emoji.get(self.weather.season, '')} "
         )
         hud_col = max(1, self.cols - len(hud))
-        out.append(move(self.rows, hud_col))
+        out.append(move(self.total_rows, hud_col))
         out.append(bg(0, 0, 0) + fg(180, 180, 180) + hud)
 
+        # Move cursor back above the pane so shell prompt stays usable
+        out.append(move(self.pane_start - 1, 1))
         out.append(RESET)
+
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
     def _update_particles(self):
-        """Advance every particle by one step; recycle those that leave the screen."""
+        """Advance every particle; recycle those that leave the pane."""
         with self._lock:
             for p in self.particles:
                 p.row += p.speed
                 p.col += p.drift + random.uniform(-0.05, 0.05)
-                # Recycle particle when it goes off-screen
-                if p.row > self.rows or p.col < 0 or p.col > self.cols:
+                if p.row >= self.rows or p.col < 0 or p.col > self.cols:
                     np = self._new_particle()
                     p.row, p.col = np.row, np.col
                     p.char = np.char
@@ -378,18 +492,41 @@ class WindowRenderer:
                 self._lightning_timer = random.uniform(0.1, 0.3)
 
     def run(self, fps: int = 20):
-        """Start the render loop. Blocks until stop() is called."""
+        """
+        Start the render loop in a background thread.
+        Returns immediately so the shell stays interactive.
+        """
         self.running = True
         interval = 1.0 / fps
-        sys.stdout.write(HIDE)
-        try:
-            while self.running:
-                self._render_frame()
-                self._update_particles()
-                time.sleep(interval)
-        finally:
-            sys.stdout.write(SHOW + RESET)
-            sys.stdout.flush()
+
+        # Reserve bottom rows by printing blank lines
+        sys.stdout.write("\n" * (self.PANE_ROWS + 1))
+        sys.stdout.flush()
+
+        def _loop():
+            try:
+                while self.running:
+                    self._render_frame()
+                    self._update_particles()
+                    time.sleep(interval)
+            finally:
+                self._clear_pane()
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        return t
+
+    def _clear_pane(self):
+        """Erase the weather pane and restore the cursor."""
+        out = []
+        for i in range(self.PANE_ROWS + 1):
+            abs_row = self.pane_start + i
+            out.append(move(abs_row, 1))
+            out.append(ansi("2K"))  # clear line
+        out.append(move(self.pane_start, 1))
+        out.append(SHOW + RESET)
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
 
     def stop(self):
         self.running = False
