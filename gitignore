@@ -19,3 +19,5 @@ env/
 # Editor
 .vscode/
 .idea/
+
+# openpane cache (generated images live in ~/.openpane/cache/)

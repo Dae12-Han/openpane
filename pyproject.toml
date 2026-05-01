@@ -1,19 +1,24 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=42"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "openpane"
-version = "0.1.0"
+version = "0.3.0"
 description = "Open the pane. See the world beyond your terminal."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-keywords = ["terminal", "weather", "cli", "ambient", "developer-tools", "pane"]
+keywords = ["terminal", "weather", "iterm2", "windows-terminal", "ambient", "developer-tools"]
 classifiers = [
     "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: Terminals",
     "Topic :: Utilities",
+]
+dependencies = [
+    "Pillow>=9.0",
 ]
 
 [project.scripts]
